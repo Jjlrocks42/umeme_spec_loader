@@ -1,0 +1,158 @@
+# File: update_umeme_specifications.magik
+# Date: 2023/05/29 09:01
+# Description:
+
+# Variable Assignment
+p_file_name << "C:\Smallworld52101\spec_loader\eo_wire_spec.csv"
+dataset_name << :electric
+collection_name << :eo_wire_spec
+table_name << gis_program_manager.cached_dataset(dataset_name).collections[collection_name]
+!print_length! << 50
+
+# Global procedure to ensure all field values are valid
+_global convert_type << _proc (type, field_value)
+    field_type << type.phys_type
+    _if field_type = "ds_double" _or field_type = "ds_int" _or field_type = "ds_long" _or field_type = "ds_uint" _then
+        _return field_value.as_number()
+    _elif field_type = "ds_float" _then
+        _if field_value <> "" _then
+            _return field_value.as_number().as_float
+        _else
+            _return field_value
+        _endif
+    _elif field_type = "ds_char16canon" _then
+        _return field_value
+    _elif field_type = "ds_bool" _or field_type = "ds_bool_vec" _then
+        _return field_value = "Yes"
+    _else
+        _return field_value.as_number()
+    _endif
+_endproc
+$
+
+# Procedure for loading the database
+load_umeme_spec << _proc @load_umeme_spec()
+    database_view << gis_program_manager.databases[dataset_name]
+    l_dbv << database_view.collections[collection_name].source_view
+    spec_collection << database_view.collections[collection_name]
+    l_dbv << spec_collection.source_view
+    l_dd << l_dbv.get_writable_dd_extension()
+    ok? << l_dd.start_lwt()
+
+    _if system.file_exists?(p_file_name) _then
+        input_text_stream << external_text_input_stream.new(p_file_name)
+        spec_headers_props << queue.new()
+        record_count << 1
+
+        _if (line_value << input_text_stream.get_line()) _isnt _unset _then
+            _for header _over line_value.split_by("|", _true).fast_elements()
+                spec_headers_props.add(header.lowercase.as_symbol())
+            _endloop
+        _endif
+
+        _loop
+            _if (l_line_text << input_text_stream.get_line()) _isnt _unset _then
+                _local column_num << 1
+                _local spec_record << property_list.new()
+                line_value << l_line_text.split_by("|", _true)
+
+                _for field_value _over line_value.elements()
+                    field_name << spec_headers_props[column_num]
+                    table_field_name << table_name.field(field_name.as_symbol())
+
+                    _if table_field_name.type.enumerator _isnt _unset _then
+                        formatted_value << table_field_name.type.enumerator.id_for(field_value.trim_spaces())
+                        spec_record[spec_headers_props[column_num]] << formatted_value
+                    _elif table_field_name.stored_unit _is _unset _then
+                        _if field_value = "" _then
+                            field_unset_value << table_field_name.unset_value
+                            default_value << table_field_name.default_value
+
+                            _if field_unset_value <> "" _then
+                                unit_value << field_unset_value.write_string.as_number()
+                                is_unset? << unit_value.as_number()
+
+                                _if is_unset? _is _unset _then
+                                    _if default_value _isnt _unset _and unit_value? _is _unset _then
+                                        spec_record[spec_headers_props[column_num]] << default_value
+                                    _elif unit_value? _is _unset _then
+                                        spec_record[spec_headers_props[column_num]] << unit_value
+                                    _endif
+                                _else
+                                    _if default_value _isnt _unset _then
+                                        spec_record[spec_headers_props[column_num]] << default_value
+                                    _else
+                                        spec_record[spec_headers_props[column_num]] << convert_type(table_field_name.type, unit_value)
+                                    _endif
+                                _endif
+                            _else
+                                spec_record[spec_headers_props[column_num]] << field_value
+                            _endif
+                        _else
+                            spec_record[spec_headers_props[column_num]] << convert_type(table_field_name.type, field_value)
+                        _endif
+                    _else
+                        value_with_stored_unit << field_value.split_by(" ", _true)
+
+                        _if field_value = "" _then
+                            rec_field_value << table_field_name.unset_value.write_string
+                            value_with_stored_unit << rec_field_value.split_by(" ", _true)
+                            value << value_with_stored_unit[1]
+                            formatted_value << value.split_by(".", _true)[1]
+                            spec_record[spec_headers_props[column_num]] << convert_type(table_field_name.type, formatted_value.as_number())
+                        _elif value_with_stored_unit.size > 1 _then
+                            value << value_with_stored_unit[1]
+                            unit << value_with_stored_unit[2]
+                            un_manager << unit_manager.unit(unit.trim_spaces().as_symbol())
+                            un_manager.default_format
+                            unit_value << un_manager.new_value(value.trim_spaces().as_number().as_float)
+                            spec_record[spec_headers_props[column_num]] << unit_value
+                        _else
+                            spec_record[spec_headers_props[column_num]] << convert_type(table_field_name.type, field_value.trim_spaces())
+                        _endif
+                    _endif
+
+                    column_num +<< 1
+                _endloop
+
+                _try
+                    l_specs << l_dd.collections[collection_name]
+                    l_props << l_specs.new_detached_record()
+
+                    _for field_name _over spec_headers_props.elements()
+                        field_val << spec_record[field_name]
+                        _if field_val _isnt _unset _then
+                            l_props.perform(field_name.with_chevron, field_val)
+                        _endif
+                    _endloop
+
+                    l_props.id << record_count
+                    l_specs.update(l_props)
+                    ok? << _true
+                    record_count << record_count + 1
+                _when insert_transaction_failed
+                    # Error during updating
+                _endtry
+            _else
+                _leave
+            _endif
+        _endloop
+
+        # Updating of records has been completed
+
+        database_view.checkpoint("After load spec mapping")
+
+        # Commit the changes to the database
+        _protection
+            input_text_stream.close()
+            l_dd.end_lwt(ok?)
+            l_dd.commit()
+            database_view.commit()
+            database_view.release_writable_dd_extension(l_dd)
+            database_view.perform_frozen(:rollforward|()|)
+        _endprotect
+    _else
+        write("Cannot access the file ", p_file_name)
+    _endif
+_endproc
+$
